@@ -28,6 +28,7 @@ from flexgen.utils import (GB, project_decode_latency,
 from flexgen.opt_config import (get_opt_config,
     disable_torch_init, disable_hf_opt_init)
 
+from deepspeed.runtime.utils import see_memory_usage
 
 def get_filename(model_name, batch_size, prompt_len, gen_len,
                  cpu_offload, disk_offload, num_nodes, num_gpus_per_node,
@@ -261,27 +262,79 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     with torch.no_grad():
         output_ids = model.generate(input_ids=input_ids, **generate_kwargs_warmup)
 
+    # add timing hooks
+    def add_model_hooks(model):
+        def start_time_hook(module, input):
+            if hasattr(module, 'stage') and module.stage == "decode":
+                return
+            elif hasattr(module, 'stage') and module.stage == 'prefill':
+                torch.cuda.synchronize()
+                module.__start_time__ = time.time()
+
+        def end_time_hook(module, input, output):
+            if hasattr(module, 'stage') and module.stage == "decode":
+                return
+            elif hasattr(module, 'stage') and module.stage == 'prefill':
+                torch.cuda.synchronize()
+                module.__duration__ = time.time() - module.__start_time__
+                module.stage = "decode"
+
+        if not hasattr(model, '__start_time_hook_handle'):
+            model.__start_time_hook_handle__ = model.register_forward_pre_hook(
+                start_time_hook,
+            )
+
+        if not hasattr(model, '__end_time_hook_handle__'):
+            model.__end_time_hook_handle__ = model.register_forward_hook(
+                end_time_hook,
+            )
+    add_model_hooks(model)
+    def set_model_stage(model, stage):
+        model.stage = stage
+
     # Run
-    print("benchmark")
-    timers("generate-forward").reset()
+    print(f"benchmark, {execute_gen_len}, {input_ids.shape}")
     generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
+    prefill_timings = []
+    see_memory_usage("before generate", force=True)
+    timers("generate-forward").start()
     with torch.no_grad():
+        set_model_stage(model, "prefill")
         output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
+        prefill_timings.append(model.__duration__)
+    timers("generate-forward").stop()
+    see_memory_usage("after generate", force=True)
+
     costs = timers("generate-forward").costs
 
     if use_deepspeed and args.local_rank != 0:
         return
 
+    def remove_model_hooks(module):
+        if hasattr(module, '__start_time_hook_handle__'):
+            module.__start_time_hook_handle__.remove()
+            del module.__start_time_hook_handle__
+        if hasattr(module, '__end_time_hook_handle__'):
+            module.__end_time_hook_handle__.remove()
+            del module.__end_time_hook_handle__
+        if hasattr(module, 'stage'):
+            del module.stage
+        if hasattr(module, '__duration__'):
+            del module.__duration__
+
     # Log output
-    prefill_latency = costs[0]
+    print("log")
+    total_latency = costs[0]
+    print(prefill_timings)
+    prefill_latency = np.mean(prefill_timings)
+    remove_model_hooks(model)
     prefill_throughput = batch_size * prompt_len / prefill_latency
     if cut_gen_len:  # project latency of cut_gen_len to gen_len
         decode_latency = project_decode_latency(costs, prompt_len, gen_len)
     else:
-        decode_latency = sum(costs[1:])
+        decode_latency = total_latency - prefill_latency
     decode_throughput = batch_size * (gen_len - 1) / max(decode_latency, 1e-10)
     num_generated_tokens = batch_size * gen_len
-    total_latency = prefill_latency + decode_latency
     total_throughput = num_generated_tokens / total_latency
     gpu_peak_mem = torch.cuda.max_memory_allocated(torch.device("cuda"))
     out_str = ""
