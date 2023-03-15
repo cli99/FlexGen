@@ -113,8 +113,9 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
         },
         "zero_optimization": {
             "stage": 3,
-            "stage3_prefetch_bucket_size": hidden_size * hidden_size,
-            "stage3_param_persistence_threshold": 0,
+            "stage3_prefetch_bucket_size": 2 * hidden_size * hidden_size,
+            "stage3_param_persistence_threshold": hidden_size,
+            "stage3_max_live_parameters": 2 * hidden_size * hidden_size,
         },
         "steps_per_print": 2000,
         "train_batch_size": args.batch_size,
@@ -149,6 +150,7 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
     ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
     ds_engine.module.eval()
     model = ds_engine.module
+    print(f'model.config = {model.config}')
 
     return model
 
@@ -213,7 +215,7 @@ def get_hf_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
 def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
                    cpu_offload, disk_offload, offload_dir, use_int8,
                    num_nodes, num_gpus_per_node, use_deepspeed, dummy,
-                   output_file, pkl_file, no_log, verbose):
+                   output_file, pkl_file, no_log, verbose, kv_offload):
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_name.replace("175b", "66b"), padding_side="left")
@@ -256,6 +258,10 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
                           padding="max_length",
                           max_length=prompt_len).input_ids.cuda()
 
+    # set kv_offload in model config
+    if kv_offload:
+        model.config.kv_offload = True
+
     # Warmup
     print("wamup")
     generate_kwargs_warmup = dict(max_new_tokens=1, do_sample=False)
@@ -294,7 +300,7 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
 
     # Run
     print(f"benchmark, {execute_gen_len}, {input_ids.shape}")
-    generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
+    generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False, kv_offload=kv_offload)
     prefill_timings = []
     see_memory_usage("before generate", force=True)
     timers("generate-forward").start()
@@ -387,6 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--disk-offload", action="store_true")
     parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir")
+    parser.add_argument("--kv-offload", action="store_true", help="Use kv offload to cpu.")
     parser.add_argument("--int8", action="store_true")
 
     parser.add_argument("--log-file", type=str, default="auto")
@@ -413,4 +420,4 @@ if __name__ == "__main__":
                    os.path.abspath(os.path.expanduser(args.offload_dir)),
                    args.int8, num_nodes, num_gpus_per_node, use_deepspeed,
                    args.dummy, args.log_file, args.pkl_file,
-                   args.no_log, args.verbose)
+                   args.no_log, args.verbose, args.kv_offload)
