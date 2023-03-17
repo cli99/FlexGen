@@ -113,7 +113,7 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
         },
         "zero_optimization": {
             "stage": 3,
-            "stage3_prefetch_bucket_size": 2 * hidden_size * hidden_size,
+            "stage3_prefetch_bucket_size": 0, #2 * hidden_size * hidden_size,
             "stage3_param_persistence_threshold": hidden_size,
             "stage3_max_live_parameters": 2 * hidden_size * hidden_size,
         },
@@ -263,10 +263,10 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
         model.config.kv_offload = True
 
     # Warmup
-    print("wamup")
-    generate_kwargs_warmup = dict(max_new_tokens=1, do_sample=False)
-    with torch.no_grad():
-        output_ids = model.generate(input_ids=input_ids, **generate_kwargs_warmup)
+    # print("wamup")
+    # generate_kwargs_warmup = dict(max_new_tokens=1, do_sample=False)
+    # with torch.no_grad():
+    #     output_ids = model.generate(input_ids=input_ids, **generate_kwargs_warmup)
 
     # add timing hooks
     def add_model_hooks(model):
@@ -300,17 +300,16 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
 
     # Run
     print(f"benchmark, {execute_gen_len}, {input_ids.shape}")
-    generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False, kv_offload=kv_offload)
+    generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
     prefill_timings = []
-    see_memory_usage("before generate", force=True)
-    timers("generate-forward").start()
-    with torch.no_grad():
-        set_model_stage(model, "prefill")
-        output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
-        prefill_timings.append(model.__duration__)
-    timers("generate-forward").stop()
-    see_memory_usage("after generate", force=True)
-
+    timer = timers("generate-forward")
+    for _ in range(2):
+        timer.start(sync_func=torch.cuda.synchronize)
+        with torch.no_grad():
+            set_model_stage(model, "prefill")
+            output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
+            prefill_timings.append(model.__duration__)
+        timer.stop(sync_func=torch.cuda.synchronize)
     costs = timers("generate-forward").costs
 
     if use_deepspeed and args.local_rank != 0:
@@ -330,9 +329,9 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
 
     # Log output
     print("log")
-    total_latency = costs[0]
-    print(prefill_timings)
-    prefill_latency = np.mean(prefill_timings)
+    print(f'costs = {costs}, prefill_timings = {prefill_timings}')
+    total_latency = costs[-1]
+    prefill_latency = prefill_timings[-1] # np.mean(prefill_timings)
     remove_model_hooks(model)
     prefill_throughput = batch_size * prompt_len / prefill_latency
     if cut_gen_len:  # project latency of cut_gen_len to gen_len
