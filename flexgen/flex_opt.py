@@ -340,7 +340,6 @@ class SelfAttention:
             return
 
         k_home, v_home = cache_home.val
-
         # Pick code path
         if self.policy.compress_cache:
             path = 0
@@ -376,8 +375,8 @@ class SelfAttention:
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(0, k_home.shape[1]))
+            print(f'378 k_buf.shape = {k_buf.shape}, k_buf.dtype = {k_buf.dtype}, k_buf.device = {k_buf.device}, k_home.dtype = {k_home.dtype}, k_home.device = {k_home.device}')
             general_copy(k_buf, indices, k_home, indices)
-
             if self.policy.attn_sparsity >= 1.0:
                 general_copy(v_buf, indices, v_home, indices)
                 cache_read_buf.store(((k_buf, False), (v_buf, False)))
@@ -417,7 +416,6 @@ class SelfAttention:
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
-
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
@@ -449,7 +447,11 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            print(f'self.attention_compute = {self.attention_compute}')
+            print(f'h.device = {h.device}, mask.device = {mask.device}, w_q.device = {w_q.device}, b_q.device = {b_q.device}, w_k.device = {w_k.device}, b_k.device = {b_k.device}, w_v.device = {w_v.device}, b_v.device = {b_v.device}, w_out.device = {w_out.device}, b_out.device = {b_out.device}, w_ln.device = {w_ln.device}, b_ln.device = {b_ln.device}, n_head = {n_head}, donate = {donate}, self.policy.compress_cache = {self.policy.compress_cache}, self.policy.comp_cache_config = {self.policy.comp_cache_config}')
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            print(f'455 k_cache.dtype = {k_cache.dtype}, v_cache.dtype = {v_cache.dtype}, k_cache.device = {k_cache.device}, v_cache.device = {v_cache.device}, k_cache.shape = {k_cache.shape}, v_cache.shape = {v_cache.shape}')
+
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,

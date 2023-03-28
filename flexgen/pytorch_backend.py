@@ -368,6 +368,7 @@ class TorchDevice:
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                 attn_sparsity, compress_cache, comp_config):
         """Multi-head attention (decoding phase)."""
+        print(f'371, inputs.device: {inputs.device}')
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -382,6 +383,8 @@ class TorchDevice:
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
+        print(f'386, hidden.device: {hidden.device}, hidden.dtype = {hidden.dtype}, w_q.device = {w_q.device}, w_q.dtype={w_q.dtype}')
+
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
         k = F.linear(hidden, w_k.data, bias=b_k.data)
@@ -391,6 +394,7 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
 
+
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
         # shape: (1, b * n_head, head_dim)
@@ -398,8 +402,12 @@ class TorchDevice:
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
+        print(f'k_new.dtype = {k_new.dtype}, k_new.device = {k_new.device}')
+
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
+                print(f'before slicing, k.dtype = {k.dtype}, k.device = {k.device}, k_cache.data[-1].dtype = k_cache.data[-1].dtype, k_cache.data[-1].device = {k_cache.data[-1].device}')
+
                 if compress_cache:
                     # shape: (s, b * n_head, head_dim)
                     k = k_cache.device.decompress(k_cache)[:src_s]
@@ -411,6 +419,8 @@ class TorchDevice:
                 k[src_s - 1:src_s] = k_new
                 v[src_s - 1:src_s] = v_new
 
+                print(f'after slicing k.dtype = {k.dtype}, k.device = {k.device}')
+
                 # shape: (b * n_head, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
@@ -420,8 +430,10 @@ class TorchDevice:
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
+                    print(f'k.is_cuda = {k.is_cuda}, k.dtype = {k.dtype}, k.device={k.device}, q.device = {q.device}, q.dtype = {q.dtype}, v.dtype = {v.dtype}')
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
+                    print(f'after casting, k.dtype = {k.dtype}, k.device = {k.device}, q.device = {q.device}, q.dtype = {q.dtype}, v.dtype = {v.dtype}, k.is_pinned() = {k.is_pinned()}')
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim).cuda().half()
             else:  # Sparse attention

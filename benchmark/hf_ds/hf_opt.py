@@ -147,6 +147,12 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
     model = OPTForCausalLM.from_pretrained(
         dummy_weights or model_name, torch_dtype=dtype)
     model = model.eval()
+
+    # TODO: this is a workaround for torch.empty not working with dtype=torch.float32 in init
+    decoder = model.model.decoder
+    pin_buffer_shape = [len(decoder.layers), 2, decoder.max_batch_size, decoder.num_heads, decoder.max_prompt_len + decoder.max_new_tokens - 1, decoder.hidden_dim_per_head]
+    decoder.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
+
     ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
     ds_engine.module.eval()
     model = ds_engine.module
@@ -303,7 +309,7 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
     prefill_timings = []
     timer = timers("generate-forward")
-    for _ in range(2):
+    for _ in range(5):
         timer.start(sync_func=torch.cuda.synchronize)
         with torch.no_grad():
             set_model_stage(model, "prefill")
@@ -347,7 +353,7 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     if verbose >= 2:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0, len(outputs)-1]:
+        for i in [0, (len(outputs)-1)//2, len(outputs)-1]:
             show_str += f"{i}: {outputs[i]}\n"
             show_str += 70 * '-' + "\n"
         print(show_str)
