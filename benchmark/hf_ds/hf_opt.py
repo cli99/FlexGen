@@ -19,7 +19,7 @@ import numpy as np
 from accelerate import (infer_auto_device_map, init_empty_weights,
     load_checkpoint_and_dispatch)
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from transformers import OPTForCausalLM
+from opt.modeling_opt import OPTForCausalLM
 import torch
 
 from flexgen.timer import timers
@@ -267,6 +267,7 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     # set kv_offload in model config
     if kv_offload:
         model.config.kv_offload = True
+    print(model, model.config)
 
     # Warmup
     # print("wamup")
@@ -301,18 +302,25 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
                 end_time_hook,
             )
     add_model_hooks(model)
+
     def set_model_stage(model, stage):
         model.stage = stage
+
+    # decoder = model.model.decoder
+    # pin_buffer_shape = [len(decoder.layers), 2, decoder.max_batch_size, decoder.num_heads, decoder.max_prompt_len + decoder.max_new_tokens - 1, decoder.hidden_dim_per_head]
 
     # Run
     print(f"benchmark, {execute_gen_len}, {input_ids.shape}")
     generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
     prefill_timings = []
     timer = timers("generate-forward")
-    for _ in range(5):
+    for _ in range(3):
         timer.start(sync_func=torch.cuda.synchronize)
         with torch.no_grad():
             set_model_stage(model, "prefill")
+            # if decoder.past_key_values_pin_mem is not None:
+                # del decoder.past_key_values_pin_mem
+            # decoder.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
             output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
             prefill_timings.append(model.__duration__)
         timer.stop(sync_func=torch.cuda.synchronize)

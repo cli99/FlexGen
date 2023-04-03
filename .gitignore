@@ -1,6 +1,6 @@
 # Mac system files
 .DS_store
-
+out*
 # built binaries
 benchmark/third_party/pagecache-mangagement/trunk/fadv
 benchmark/third_party/pagecache-mangagement/trunk/*.so
