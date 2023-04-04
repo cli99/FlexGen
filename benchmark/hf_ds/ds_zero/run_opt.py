@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+import gc
 
 import numpy as np
 
@@ -22,83 +23,20 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from models.modeling_opt import OPTForCausalLM
 import torch
 
-from flexgen.timer import timers
-from flexgen.utils import (GB, project_decode_latency,
-    write_benchmark_log)
-from flexgen.opt_config import (get_opt_config,
-    disable_torch_init, disable_hf_opt_init)
+from timer import timers
+from utils import (disable_torch_init, GB, project_decode_latency,
+    write_benchmark_log, model_bytes, cache_bytes, hidden_bytes, get_filename, meta_to_cpu)
 
 from deepspeed.runtime.utils import see_memory_usage
 
-def get_filename(model_name, batch_size, prompt_len, gen_len,
-                 cpu_offload, disk_offload, num_nodes, num_gpus_per_node,
-                 use_deepspeed):
-    modelsize = model_name.split('-')[-1]
-    if use_deepspeed:
-        filename = "ds-"
-    else:
-        filename = "hf-"
-    filename += f"{modelsize}-bs{batch_size}-prompt{prompt_len}-gen{gen_len}-"
-    filename += f"n{num_nodes}x{num_gpus_per_node}-"
-    if cpu_offload:
-        filename += "cpu"
-    elif disk_offload:
-        filename += "disk"
-    else:
-        filename += "gpu"
-    return filename
 
-
-def meta_to_cpu(container, dtype=None):
-    if isinstance(container, torch.Tensor):
-        return torch.empty(*container.shape, dtype=dtype or container.dtype)
-    elif isinstance(container, tuple):
-        return tuple(meta_to_cpu(x, dtype) for x in container)
-    elif isinstance(container, dict):
-        return dict((k, meta_to_cpu(v, dtype)) for k, v in container.items())
-    else:
-        raise ValueError(f"Invalid type: {container}")
-
-
-def realize_meta_module(module, dtype=None, device=None):
-    for name, child in module.named_children():
-        realize_meta_module(child, dtype, device)
-
-    keys = list(module._parameters.keys())
-    for k in keys:
-        v = module._parameters[k]
-        if v is not None:
-            module._parameters[k] = torch.nn.Parameter(
-                torch.empty(*v.shape, dtype=dtype or v.dtype,
-                    device=device or v.device))
-
-    keys = list(module._buffers.keys())
-    for k in keys:
-        v = module._buffers[k]
-        assert v is None
-
-
-def get_model_config(model_name):
-    if "175b" in model_name:
-        config = AutoConfig.from_pretrained("facebook/opt-66b")
-        config.hidden_size = 12288
-        config.word_embed_proj_dim = 12288
-        config.ffn_dim = 12288 * 4
-        config.num_attention_heads = 96
-        config.num_hidden_layers = 96
-    else:
-        config = AutoConfig.from_pretrained(model_name)
-
-    return config
-
-
-def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
+def get_ds_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
                      dummy_weights):
     import deepspeed
     import torch.distributed as dist
     from transformers.deepspeed import HfDeepSpeedConfig
 
-    config = get_model_config(model_name)
+    config = AutoConfig.from_pretrained(model_name)
     hidden_size = config.hidden_size
     deepspeed.init_distributed("nccl")
     rank = dist.get_rank()
@@ -142,16 +80,15 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
           "overlap_events": True,
         }
 
-    dschf = HfDeepSpeedConfig(ds_config)
+    dschf = HfDeepSpeedConfig(ds_config)  # this tells from_pretrained to instantiate directly on gpus
+
+    # clear cache / free memory
+    torch.cuda.empty_cache()
+    gc.collect()
 
     model = OPTForCausalLM.from_pretrained(
         dummy_weights or model_name, torch_dtype=dtype)
     model = model.eval()
-
-    # TODO: this is a workaround for torch.empty not working with dtype=torch.float32 in init
-    decoder = model.model.decoder
-    pin_buffer_shape = [len(decoder.layers), 2, decoder.max_batch_size, decoder.num_heads, decoder.max_prompt_len + decoder.max_new_tokens - 1, decoder.hidden_dim_per_head]
-    decoder.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
 
     ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
     ds_engine.module.eval()
@@ -161,7 +98,7 @@ def get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
     return model
 
 
-def get_hf_opt_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
+def get_hf_model(model_name, dtype, cpu_offload, disk_offload, offload_dir,
                      num_gpus, dummy_weights):
     if num_gpus == 1 and dtype != torch.int8:
         # Here we use a custom device_map instead of device_map == "auto"
@@ -232,8 +169,9 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     else:
         dtype = torch.float16
 
+    config = AutoConfig.from_pretrained(model_name)
+
     if dummy:
-        config = get_model_config(model_name)
         filename = os.path.join(offload_dir,
             f"{model_name.replace('/', '-')}-hf-weights/")
         if not os.path.exists(filename):
@@ -248,10 +186,10 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
 
     print("load model")
     if use_deepspeed:
-        model = get_ds_opt_model(model_name, dtype, cpu_offload, disk_offload,
+        model = get_ds_model(model_name, dtype, cpu_offload, disk_offload,
             offload_dir, dummy_weights)
     else:
-        model = get_hf_opt_model(model_name, dtype, cpu_offload, disk_offload,
+        model = get_hf_model(model_name, dtype, cpu_offload, disk_offload,
             offload_dir, num_gpus_per_node, dummy_weights)
 
     # Run generation
@@ -267,13 +205,9 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     # set kv_offload in model config
     if kv_offload:
         model.config.kv_offload = True
+
     print(model, model.config)
 
-    # Warmup
-    # print("wamup")
-    # generate_kwargs_warmup = dict(max_new_tokens=1, do_sample=False)
-    # with torch.no_grad():
-    #     output_ids = model.generate(input_ids=input_ids, **generate_kwargs_warmup)
 
     # add timing hooks
     def add_model_hooks(model):
@@ -306,9 +240,6 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
     def set_model_stage(model, stage):
         model.stage = stage
 
-    # decoder = model.model.decoder
-    # pin_buffer_shape = [len(decoder.layers), 2, decoder.max_batch_size, decoder.num_heads, decoder.max_prompt_len + decoder.max_new_tokens - 1, decoder.hidden_dim_per_head]
-
     # Run
     print(f"benchmark, {execute_gen_len}, {input_ids.shape}")
     generate_kwargs = dict(max_new_tokens=execute_gen_len, do_sample=False)
@@ -318,9 +249,6 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
         timer.start(sync_func=torch.cuda.synchronize)
         with torch.no_grad():
             set_model_stage(model, "prefill")
-            # if decoder.past_key_values_pin_mem is not None:
-                # del decoder.past_key_values_pin_mem
-            # decoder.past_key_values_pin_mem = torch.empty(pin_buffer_shape, dtype=torch.float32, device='cpu', pin_memory=True)
             output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
             prefill_timings.append(model.__duration__)
         timer.stop(sync_func=torch.cuda.synchronize)
@@ -380,11 +308,10 @@ def run_generation(model_name, batch_size, prompt_len, gen_len, cut_gen_len,
         filename = args.log_file
 
     projected = bool(cut_gen_len)
-    opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(batch_size, prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(batch_size, prompt_len + gen_len)
+    cache_size = cache_bytes(config, batch_size, prompt_len + gen_len)
+    hidden_size = hidden_bytes(config, batch_size, prompt_len + gen_len)
     log_str = write_benchmark_log(filename,
-        opt_config.model_bytes(), cache_size, hidden_size,
+        model_bytes(config), cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput)
     if verbose >= 1:
